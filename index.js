@@ -1,238 +1,198 @@
 const express = require('express');
-const {
-    default: makeWASocket,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    downloadMediaMessage,
-    initAuthCreds,
-    BufferJSON
-} = require('@whiskeysockets/baileys');
-const { MongoClient } = require('mongodb');
-const Groq = require('groq-sdk');
-const pino = require('pino');
-const QRCode = require('qrcode');
-
 const app = express();
-const PORT = process.env.PORT || 3000;
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+app.use(express.json());
 
-let pairingCode = null;
-let qrCodeDataUrl = null;
-let connectionStatus = 'Iniciando servidor...';
-let sock = null;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-const SYSTEM_PROMPT = `Eres el asesor virtual oficial de IMPOR REPUESTOS S.C.A., importadores y distribuidores de repuestos originales y homologados.
-Sedes: Hangar 1 Aeropuerto Internacional de Tabatinga (frontera Colombia-Brasil) y Zona Franca Yacopí, Cundinamarca.
-Teléfono de soporte y ventas: 3158003106.
+// Memoria temporal por cliente (guarda historial y estado de transferencia)
+const sesiones = new Map();
 
-REGLAS OBLIGATORIAS:
-1. DATOS TÉCNICOS: Antes de cotizar, pide siempre marca, línea, modelo/año y número de chasis o VIN (o foto de la tarjeta de propiedad).
-2. PRECIOS E IVA: Nuestros precios son importados por zona fronteriza y NO incluyen el 19% de IVA colombiano. La cuantía mínima de despacho es de $250.000 COP.
-3. PAGOS Y ENVÍOS: No manejamos pago contraentrega. Todo despacho se realiza únicamente tras confirmar el pago del 100% vía QR corporativo Davivienda o llave empresarial Bre-B: 0088008647.
-4. DOCUMENTACIÓN: Importamos con R.U.T. brasilero; si un cliente solicita NIT o Cámara de Comercio, o pide un repuesto exótico/complejo o muestra inconformidad, responde exactamente: "Un momento, lo comunico con el jefe de bodega Hugo Vélez para validar disponibilidad y despacho directo."
-5. GARANTÍA: Todos los repuestos originales vienen sellados de fábrica con garantía de 1 año (no se destapan antes del envío).
-6. ESTILO: Sé amable, concreto, profesional y directo. No inventes precios si no tienes la referencia confirmada.`;
+const MENSAJE_FOTO = 'Un momento, te comunico al gerente de ventas Hugo Vélez para que se apersone de tu repuesto. Feliz día.';
+const MENSAJE_COTIZACION = 'Un momento, te transfiero la llamada con el gerente de ventas Hugo Vélez para que acabe de cerrar el negocio. Feliz día.';
 
-// Adaptador de sesión en MongoDB para no perder la conexión en Render
-async function useMongoDBAuthState(collection) {
-    const writeData = async (data, id) => {
-        const serialized = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
-        await collection.replaceOne({ _id: id }, { _id: id, ...serialized }, { upsert: true });
-    };
+const SYSTEM_PROMPT = `Eres el agente autónomo de ventas de IMPOR REPUESTOS S.C.A., empresa importadora y distribuidora directa de repuestos automotrices originales y homologados desde Brasil hacia toda Colombia, dirigida por el gerente de ventas Hugo Vélez.
 
-    const readData = async (id) => {
-        const doc = await collection.findOne({ _id: id });
-        if (!doc) return null;
-        const { _id, ...rest } = doc;
-        return JSON.parse(JSON.stringify(rest), BufferJSON.reviver);
-    };
+UBICACIONES Y OPERACIÓN:
+- Sede principal de importación: Hangar 1, Aeropuerto Internacional de Tabatinga (frontera Colombia - Brasil).
+- Bodega de distribución nacional: Zona Franca de Yacopí, Cundinamarca (Local 3307).
+- Línea oficial de soporte y WhatsApp: 3158003106.
 
-    const removeData = async (id) => {
-        await collection.deleteOne({ _id: id });
-    };
+FLUJO OBLIGATORIO DE VENTAS (SEGUIR EN ORDEN ESTRICTO):
 
-    const creds = (await readData('creds')) || initAuthCreds();
+PASO 1 - PRESENTACIÓN FORMAL Y ELECCIÓN TEXTO VS. FOTO:
+- Cuando el cliente salude o pregunte por un repuesto sin haber enviado los datos completos del vehículo, preséntate formalmente y dale a elegir con este mensaje exacto:
+  "¡Bienvenido a IMPOR REPUESTOS S.C.A.! Somos importadores directos desde Brasil hacia toda Colombia. Si me envías fotos, debes esperar a que el gerente de ventas Hugo Vélez te atienda para hacerte esa cotización. Si me escribes todos los datos en texto (repuesto que necesitas, marca, año y número de chasis/VIN), yo realizo la cotización mucho más rápido al instante. Ya tú decides. Muchas gracias."
+- IMPORTANTE: Espera a que el cliente envíe los datos del vehículo y el VIN en texto antes de dar precios. Si envió solo una parte (ej. solo la marca), pídele amablemente en texto los datos que faltan (año, VIN/chasis y repuesto) sin repetir toda la presentación.
 
-    return {
-        state: {
-            creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            let value = await readData(`${type}-${id}`);
-                            data[id] = value;
-                        })
-                    );
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, key) : removeData(key));
-                        }
-                    }
-                    await Promise.all(tasks);
-                }
-            }
+PASO 2 - COTIZACIÓN EN LÍNEA (ORIGINAL Y HOMOLOGADO A PRECIO INTERMEDIO ÚNICO):
+- Apenas el cliente entregue los datos completos del vehículo y el repuesto en texto, verifica el valor comercial real en pesos colombianos (COP) para ese vehículo y pieza exacta, y entrega DOS OPCIONES CON PRECIO INTERMEDIO ÚNICO (una sola cifra redonda y firme por opción; PROHIBIDO dar rangos como "entre X y Y"):
+  * **Repuesto Original:** $[PRECIO INTERMEDIO ORIGINAL] (nuevo original sellado de fábrica con garantía de 1 año).
+  * **Repuesto Homologado:** $[PRECIO INTERMEDIO HOMOLOGADO] (calidad certificada de importación).
+- Aclara siempre que son precios directos de frontera sin IVA del 19%.
+- **NORMA MAYORISTA (SUPERIOR A $250.000 COP):** Somos proveedores mayoristas, NO minoristas al detal. Si el repuesto cotizado vale $250.000 COP o menos, dile amablemente: "Somos proveedores mayoristas y únicamente despachamos compras superiores a $250.000 COP. Para esta pieza individual de menor cuantía debes conseguirla con un proveedor minorista local, o si deseas agregar más repuestos para superar los $250.000 COP con gusto te cotizamos el pedido. Feliz día."
+- Si el valor supera los $250.000 COP, termina el mensaje SIEMPRE con esta pregunta exacta:
+  "¿Deseas realizar la compra o deseas que te envíe la cotización?"
+
+PASO 3A - SI EL CLIENTE DICE QUE DESEA REALIZAR LA COMPRA / PIDE DATOS DE PAGO:
+- Envíale de inmediato los datos oficiales de pago:
+  * **Llave empresarial Bre-B:** 0088008647 (a nombre de IMPOR REPUESTOS S.C.A.)
+  * **Código QR corporativo Davivienda** (indicar que también puede solicitar la imagen del QR si la requiere).
+  * Condición: Pago 100% anticipado previo al despacho (pago hecho, repuesto enviado; bajo ninguna circunstancia manejamos pago contra entrega).
+  * Nota tributaria (solo si pregunta): Importamos con R.U.T. brasilero; no manejamos NIT ni Cámara de Comercio colombiana.
+
+PASO 3B - SI EL CLIENTE DICE QUE NECESITA QUE LE HAGAN LA COTIZACIÓN (O QUIERE CERRAR CON ASESOR):
+- Detén el flujo automático y responde TEXTUALMENTE:
+  "${MENSAJE_COTIZACION}"
+
+REGLA DE ORO: Sé breve, cordial y directo. Jamás menciones enlaces, páginas web externas ni muestres procesos internos; entrega únicamente la respuesta comercial limpia al cliente.`;
+
+// Detecta si AutoResponder recibió una foto (tarjeta de propiedad o repuesto)
+function esMensajeConFoto(texto) {
+  const limpio = texto.toLowerCase().trim();
+  return (
+    limpio.includes('📷') ||
+    limpio.includes('imagen') ||
+    limpio.includes('foto') ||
+    limpio === 'image' ||
+    limpio === '[image]' ||
+    limpio.startsWith('http')
+  );
+}
+
+// Consulta los modelos activos de tu cuenta Groq con respaldo automático
+async function consultarGroq(mensajes) {
+  const modelos = ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b'];
+
+  for (const modelo of modelos) {
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
         },
-        saveCreds: () => writeData(creds, 'creds')
-    };
-}
+        body: JSON.stringify({
+          model: modelo,
+          messages: mensajes,
+          temperature: 0.2,
+          max_tokens: 400
+        })
+      });
 
-async function connectToWhatsApp() {
-    try {
-        const mongoUri = process.env.MONGODB_URI;
-        if (!mongoUri) {
-            connectionStatus = 'Error: Falta variable MONGODB_URI en Render';
-            console.error(connectionStatus);
-            return;
-        }
-
-        const client = new MongoClient(mongoUri);
-        await client.connect();
-        const db = client.db('impor_repuestos_bot');
-        const authCollection = db.collection('baileys_auth');
-
-        const { state, saveCreds } = await useMongoDBAuthState(authCollection);
-        const { version } = await fetchLatestBaileysVersion();
-
-        sock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: false,
-            auth: state,
-            browser: ['Impor Repuestos Bot', 'Chrome', '1.0.0']
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-
-            if (qr) {
-                qrCodeDataUrl = await QRCode.toDataURL(qr);
-                connectionStatus = 'Esperando vinculación (Escanea el QR o usa código)';
-            }
-
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                connectionStatus = `Desconectado (${statusCode || 'error'}). Reconectando...`;
-                qrCodeDataUrl = null;
-                if (shouldReconnect) {
-                    setTimeout(connectToWhatsApp, 5000);
-                } else {
-                    connectionStatus = 'Sesión cerrada. Borra la colección en MongoDB para volver a vincular.';
-                }
-            } else if (connection === 'open') {
-                connectionStatus = 'Conectado y operando en línea';
-                qrCodeDataUrl = null;
-                pairingCode = null;
-                console.log('Bot conectado exitosamente a WhatsApp');
-            }
-        });
-
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-            const msg = messages[0];
-            if (!msg.message || msg.key.fromMe) return;
-
-            const remoteJid = msg.key.remoteJid;
-            if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') return;
-
-            const userText =
-                msg.message.conversation ||
-                msg.message.extendedTextMessage?.text ||
-                msg.message.imageMessage?.caption ||
-                '';
-
-            if (!userText.trim()) return;
-
-            try {
-                await sock.sendPresenceUpdate('composing', remoteJid);
-
-                const completion = await groq.chat.completions.create({
-                    model: 'llama-3.3-70b-versatile',
-                    messages: [
-                        { role: 'system', content: SYSTEM_PROMPT },
-                        { role: 'user', content: userText }
-                    ],
-                    temperature: 0.4,
-                    max_tokens: 500
-                });
-
-                const reply = completion.choices[0]?.message?.content;
-                if (reply) {
-                    // Pausa natural de 5 segundos antes de responder
-                    await new Promise((resolve) => setTimeout(resolve, 5000));
-                    await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
-                }
-            } catch (err) {
-                console.error('Error procesando mensaje con Groq:', err);
-            }
-        });
-    } catch (error) {
-        connectionStatus = `Error de inicio: ${error.message}`;
-        console.error(error);
+      const data = await response.json();
+      if (response.ok && data.choices?.[0]?.message?.content) {
+        return data.choices[0].message.content.trim();
+      }
+      console.warn(`Aviso con modelo ${modelo}:`, JSON.stringify(data));
+    } catch (err) {
+      console.error(`Fallo de red con modelo ${modelo}:`, err);
     }
+  }
+  return null;
 }
 
-// Panel web para ver estado y vincular desde el celular
+app.post('/webhook', async (req, res) => {
+  try {
+    const query = req.body.query || {};
+    const sender = query.sender || 'Cliente';
+    const message = (query.message || '').trim();
+
+    if (!message) {
+      return res.json({
+        replies: [{ message: MENSAJE_FOTO }]
+      });
+    }
+
+    // Obtener o crear sesión del cliente
+    let sesion = sesiones.get(sender) || { historial: [], transferido: false, mensajeCierre: MENSAJE_COTIZACION, ultimaActividad: Date.now() };
+
+    // Reiniciar sesión si pasaron más de 2 horas de inactividad
+    if (Date.now() - sesion.ultimaActividad > 2 * 60 * 60 * 1000) {
+      sesion = { historial: [], transferido: false, mensajeCierre: MENSAJE_COTIZACION, ultimaActividad: Date.now() };
+    }
+    sesion.ultimaActividad = Date.now();
+
+    // 1. SI EL CLIENTE YA FUE TRANSFERIDO A HUGO VÉLEZ: repetir su aviso correspondiente y frenar
+    if (sesion.transferido) {
+      sesiones.set(sender, sesion);
+      return res.json({
+        replies: [{ message: sesion.mensajeCierre }]
+      });
+    }
+
+    // 2. SI LLEGA UNA FOTO (tarjeta de propiedad o repuesto): frenar ahí y avisar que Hugo Vélez se apersona
+    if (esMensajeConFoto(message)) {
+      sesion.transferido = true;
+      sesion.mensajeCierre = MENSAJE_FOTO;
+      sesiones.set(sender, sesion);
+      return res.json({
+        replies: [{ message: MENSAJE_FOTO }]
+      });
+    }
+
+    // Guardar historial del cliente (últimos 8 mensajes para mantener contexto)
+    sesion.historial.push({ role: 'user', content: message });
+    if (sesion.historial.length > 8) {
+      sesion.historial = sesion.historial.slice(-8);
+    }
+
+    const mensajesParaIA = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...sesion.historial
+    ];
+
+    let replyText = await consultarGroq(mensajesParaIA);
+
+    if (!replyText) {
+      return res.json({
+        replies: [{ message: MENSAJE_COTIZACION }]
+      });
+    }
+
+    replyText = replyText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+    // Si la IA decidió transferir al cliente a Hugo Vélez, activar bloqueo para los siguientes mensajes
+    if (replyText.includes('transfiero la llamada con el gerente de ventas Hugo Vélez')) {
+      sesion.transferido = true;
+      sesion.mensajeCierre = MENSAJE_COTIZACION;
+    }
+
+    sesion.historial.push({ role: 'assistant', content: replyText });
+    sesiones.set(sender, sesion);
+
+    return res.json({
+      replies: [{ message: replyText }]
+    });
+
+  } catch (error) {
+    console.error('Error en el servidor:', error);
+    return res.json({
+      replies: [{ message: MENSAJE_COTIZACION }]
+    });
+  }
+});
+
 app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Impor Repuestos S.C.A. - Bot</title>
-            <style>
-                body { font-family: sans-serif; background: #111; color: #fff; text-align: center; padding: 20px; }
-                .card { background: #1e1e1e; padding: 20px; border-radius: 12px; max-width: 400px; margin: auto; }
-                input, button { padding: 12px; width: 90%; margin: 8px 0; border-radius: 8px; border: none; font-size: 16px; }
-                button { background: #25D366; color: #000; font-weight: bold; cursor: pointer; }
-                .code { font-size: 28px; letter-spacing: 4px; color: #25D366; font-weight: bold; margin: 15px 0; }
-                img { max-width: 250px; border-radius: 8px; margin-top: 10px; }
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h2>IMPOR REPUESTOS S.C.A.</h2>
-                <p><strong>Estado:</strong> ${connectionStatus}</p>
-                ${qrCodeDataUrl ? `<img src="${qrCodeDataUrl}" alt="Código QR" />` : ''}
-                ${pairingCode ? `<div class="code">${pairingCode}</div>` : ''}
-                <hr style="border-color:#333; margin: 20px 0;">
-                <p>Vincular con número de teléfono (sin +):</p>
-                <form action="/pair" method="GET">
-                    <input type="text" name="phone" placeholder="Ej: 573158003106" required />
-                    <button type="submit">Generar Código de Vinculación</button>
-                </form>
-            </div>
-        </body>
-        </html>
-    `);
+  res.send('Servidor de IMPOR REPUESTOS S.C.A. activo.');
 });
 
-app.get('/pair', async (req, res) => {
-    const phone = (req.query.phone || '').replace(/\D/g, '');
-    if (!phone || !sock) {
-        return res.redirect('/');
-    }
-    try {
-        pairingCode = await sock.requestPairingCode(phone);
-    } catch (e) {
-        connectionStatus = `Error generando código: ${e.message}`;
-    }
-    res.redirect('/');
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  const VERIFY_TOKEN = 'impor_repuestos_123';
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verificado con éxito');
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
 });
 
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`Servidor activo en puerto ${PORT}`);
-    connectToWhatsApp();
+  console.log(`Servidor de IMPOR REPUESTOS corriendo en puerto ${PORT}`);
 });
+                    
           
