@@ -4,7 +4,7 @@ const app = express();
 app.use(express.json());
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const MODEL_NAME = 'llama-3.3-70b-versatile';
+const MODEL_NAME = 'qwen/qwen3.8-27b';
 
 const SYSTEM_PROMPT = `Eres el asistente virtual de IMPOR REPUESTOS S.C.A., empresa importadora de repuestos automotrices y de carga pesada ubicada en la frontera Colombia-Brasil (Aeropuerto Internacional de Tabatinga, Hangar 1) y bodega en Zona Franca Yacopí, Cundinamarca. Tu jefe de bodega y asesor comercial es Hugo Vélez (teléfono 3158003106).
 
@@ -50,8 +50,11 @@ app.post('/webhook', async (req, res) => {
       }
     );
 
-    const botReply = response.data.choices[0]?.message?.content?.trim() ||
+    let botReply = response.data.choices[0]?.message?.content?.trim() ||
       'Un momento, lo comunico con el jefe de bodega Hugo Vélez para brindarle atención personalizada.';
+
+    // Elimina cualquier bloque interno de pensamiento si el modelo de razonamiento lo incluye
+    botReply = botReply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
     return res.json({
       replies: [{ message: botReply }]
